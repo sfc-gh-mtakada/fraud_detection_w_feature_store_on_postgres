@@ -1,0 +1,189 @@
+-- =============================================================================
+-- 01_generate_history.sql : Synthetic card-payment history (90 days, ~2M rows)
+--   Normal traffic + 3 fraud patterns:
+--     P1 BURST      : 6-10 contactless txns on one card within ~5 minutes
+--     P2 HIGH_VALUE : e-commerce amount 8-20x the card's usual spend
+--     P3 TERMINAL   : one acceptor sees 8-15 different cards within an hour
+--   All timestamps are UTC (TIMESTAMP_NTZ).
+-- =============================================================================
+USE ROLE FRAUD_FS_PRODUCER;
+USE WAREHOUSE FRAUD_WH;
+ALTER SESSION SET TIMEZONE = 'UTC';
+USE SCHEMA FRAUD_DEMO.RAW;
+
+SET END_TS   = DATE_TRUNC('minute', SYSDATE());          -- SYSDATE() is UTC
+SET START_TS = DATEADD(day, -90, $END_TS);
+
+-- ---------------------------------------------------------------- master data
+INSERT OVERWRITE INTO CARDS
+SELECT
+  'C' || LPAD(SEQ4()::VARCHAR, 6, '0'),
+  CASE WHEN UNIFORM(0, 100, RANDOM()) < 75 THEN 'MASS'
+       WHEN UNIFORM(0, 100, RANDOM()) < 85 THEN 'AFFLUENT' ELSE 'CORPORATE' END,
+  DATEADD(day, -UNIFORM(100, 3000, RANDOM()), CURRENT_DATE()),
+  ARRAY_CONSTRUCT('TOKYO','OSAKA','KANAGAWA','AICHI','FUKUOKA','HOKKAIDO')[UNIFORM(0, 5, RANDOM())]::VARCHAR
+FROM TABLE(GENERATOR(ROWCOUNT => 5000));
+
+INSERT OVERWRITE INTO ACCEPTORS
+SELECT
+  'A' || LPAD(SEQ4()::VARCHAR, 5, '0'),
+  ARRAY_CONSTRUCT('5411','5812','5814','5541','5999','5732','4111','5311','7011','5691')[UNIFORM(0, 9, RANDOM())]::VARCHAR,
+  'MERCHANT_' || SEQ4(),
+  ARRAY_CONSTRUCT('TOKYO','OSAKA','KANAGAWA','AICHI','FUKUOKA','HOKKAIDO')[UNIFORM(0, 5, RANDOM())]::VARCHAR
+FROM TABLE(GENERATOR(ROWCOUNT => 800));
+
+-- Per-card spending profile (typical ticket size, contactless propensity, home acceptors)
+CREATE OR REPLACE TEMPORARY TABLE CARD_PROFILE_TMP AS
+SELECT CARD_ID,
+       CASE CUSTOMER_SEG WHEN 'MASS' THEN 2500 WHEN 'AFFLUENT' THEN 7000 ELSE 12000 END
+         * EXP(NORMAL(0, 0.4, RANDOM())) AS BASE_AMOUNT,
+       UNIFORM(0.2::FLOAT, 0.8::FLOAT, RANDOM()) AS CONTACTLESS_P,
+       ROW_NUMBER() OVER (ORDER BY CARD_ID) - 1 AS CARD_IDX
+FROM CARDS;
+
+-- ------------------------------------------------------------ normal traffic
+INSERT OVERWRITE INTO CARD_TRANSACTIONS
+WITH g AS (
+  SELECT UNIFORM(0, 4999, RANDOM()) AS CARD_IDX,
+         UNIFORM(0, 799, RANDOM())  AS ACC_IDX,
+         -- daytime-weighted timestamp: pick a day, then an hour biased toward 08-22 JST (23-13 UTC)
+         DATEADD(second, UNIFORM(0, 3599, RANDOM()),
+           DATEADD(hour, MOD(23 + UNIFORM(0, 14, RANDOM()) + IFF(UNIFORM(0, 9, RANDOM()) = 0, UNIFORM(0, 9, RANDOM()), 0), 24),
+             DATEADD(day, UNIFORM(0, 89, RANDOM()), DATE_TRUNC('day', $START_TS)))) AS TS,
+         UNIFORM(0::FLOAT, 1::FLOAT, RANDOM()) AS R_MODE,
+         NORMAL(0, 0.5, RANDOM()) AS R_AMT
+  FROM TABLE(GENERATOR(ROWCOUNT => 1980000))
+)
+SELECT UUID_STRING(), p.CARD_ID, a.ACCEPTOR_ID, g.TS,
+       GREATEST(100, ROUND(p.BASE_AMOUNT * EXP(g.R_AMT), -1)),
+       CASE WHEN g.R_MODE < p.CONTACTLESS_P THEN 'CONTACTLESS'
+            WHEN g.R_MODE < p.CONTACTLESS_P + 0.15 THEN 'ECOM'
+            WHEN g.R_MODE < 0.98 THEN 'CHIP' ELSE 'MAGSTRIPE' END,
+       a.MCC, 'D' || p.CARD_IDX, FALSE, 'HISTORY'
+FROM g
+JOIN CARD_PROFILE_TMP p ON p.CARD_IDX = g.CARD_IDX
+JOIN (SELECT ACCEPTOR_ID, MCC, ROW_NUMBER() OVER (ORDER BY ACCEPTOR_ID) - 1 AS ACC_IDX FROM ACCEPTORS) a
+  ON a.ACC_IDX = g.ACC_IDX
+WHERE g.TS < $END_TS;
+
+-- ------------------------------------------------------- P1: contactless burst
+INSERT INTO CARD_TRANSACTIONS
+WITH incidents AS (
+  SELECT UNIFORM(0, 4999, RANDOM()) AS CARD_IDX,
+         DATEADD(second, UNIFORM(0, 90*86400 - 600, RANDOM()), $START_TS) AS T0,
+         UNIFORM(6, 10, RANDOM()) AS N
+  FROM TABLE(GENERATOR(ROWCOUNT => 900))
+), exploded AS (
+  SELECT i.*, s.INDEX AS K
+  FROM incidents i, LATERAL FLATTEN(ARRAY_GENERATE_RANGE(0, i.N)) s
+)
+SELECT UUID_STRING(), p.CARD_ID, a.ACCEPTOR_ID,
+       DATEADD(second, e.K * UNIFORM(15, 40, RANDOM()), e.T0),
+       ROUND(UNIFORM(3000, 9500, RANDOM()), -1),
+       'CONTACTLESS', a.MCC, 'DX' || UNIFORM(0, 99999, RANDOM()), TRUE, 'HISTORY'
+FROM exploded e
+JOIN CARD_PROFILE_TMP p ON p.CARD_IDX = e.CARD_IDX
+JOIN (SELECT ACCEPTOR_ID, MCC, ROW_NUMBER() OVER (ORDER BY ACCEPTOR_ID) - 1 AS ACC_IDX FROM ACCEPTORS) a
+  ON a.ACC_IDX = MOD(e.CARD_IDX * 7 + e.K * 13, 800);
+
+-- ---------------------------------------------------- P2: high-value e-commerce
+INSERT INTO CARD_TRANSACTIONS
+SELECT UUID_STRING(), p.CARD_ID, a.ACCEPTOR_ID,
+       DATEADD(second, UNIFORM(0, 90*86400 - 1, RANDOM()), $START_TS),
+       ROUND(p.BASE_AMOUNT * UNIFORM(8, 20, RANDOM()), -2),
+       'ECOM', a.MCC, 'DX' || UNIFORM(0, 99999, RANDOM()), TRUE, 'HISTORY'
+FROM (SELECT UNIFORM(0, 4999, RANDOM()) AS CARD_IDX, UNIFORM(0, 799, RANDOM()) AS ACC_IDX
+      FROM TABLE(GENERATOR(ROWCOUNT => 2500))) g
+JOIN CARD_PROFILE_TMP p ON p.CARD_IDX = g.CARD_IDX
+JOIN (SELECT ACCEPTOR_ID, MCC, ROW_NUMBER() OVER (ORDER BY ACCEPTOR_ID) - 1 AS ACC_IDX FROM ACCEPTORS) a
+  ON a.ACC_IDX = g.ACC_IDX;
+
+-- ------------------------------------------- P3: compromised terminal (card testing)
+INSERT INTO CARD_TRANSACTIONS
+WITH incidents AS (
+  SELECT UNIFORM(0, 799, RANDOM()) AS ACC_IDX,
+         DATEADD(second, UNIFORM(0, 90*86400 - 3600, RANDOM()), $START_TS) AS T0,
+         UNIFORM(8, 15, RANDOM()) AS N
+  FROM TABLE(GENERATOR(ROWCOUNT => 250))
+), exploded AS (
+  SELECT i.*, s.INDEX AS K
+  FROM incidents i, LATERAL FLATTEN(ARRAY_GENERATE_RANGE(0, i.N)) s
+)
+SELECT UUID_STRING(), p.CARD_ID, a.ACCEPTOR_ID,
+       DATEADD(second, UNIFORM(0, 3000, RANDOM()), e.T0),
+       ROUND(UNIFORM(100, 1500, RANDOM()), -1),
+       'CONTACTLESS', a.MCC, 'DX' || UNIFORM(0, 99999, RANDOM()), TRUE, 'HISTORY'
+FROM exploded e
+JOIN (SELECT ACCEPTOR_ID, MCC, ROW_NUMBER() OVER (ORDER BY ACCEPTOR_ID) - 1 AS ACC_IDX FROM ACCEPTORS) a
+  ON a.ACC_IDX = e.ACC_IDX
+JOIN CARD_PROFILE_TMP p ON p.CARD_IDX = MOD(e.ACC_IDX * 31 + e.K * 337 + 11, 5000);
+
+-- ------------------------------------------- Recent dense window (last 3 days at ~2 TPS)
+-- The live simulator runs at ~2 TPS, i.e. far denser than the 90-day history (~0.26 TPS).
+-- Velocity features (per-card / per-terminal counts) must be trained on the same traffic
+-- density they are served at, so the last 3 days are generated at the simulator's rate.
+SET DENSE_START = DATEADD(day, -3, $END_TS);
+
+INSERT INTO CARD_TRANSACTIONS
+WITH g AS (
+  SELECT UNIFORM(0, 4999, RANDOM()) AS CARD_IDX, UNIFORM(0, 799, RANDOM()) AS ACC_IDX,
+         DATEADD(millisecond, UNIFORM(0, 3*86400*1000 - 1, RANDOM()), $DENSE_START) AS TS,
+         UNIFORM(0::FLOAT, 1::FLOAT, RANDOM()) AS R_MODE, NORMAL(0, 0.5, RANDOM()) AS R_AMT
+  FROM TABLE(GENERATOR(ROWCOUNT => 518400))
+)
+SELECT UUID_STRING(), p.CARD_ID, a.ACCEPTOR_ID, g.TS,
+       GREATEST(100, ROUND(p.BASE_AMOUNT * EXP(g.R_AMT), -1)),
+       CASE WHEN g.R_MODE < p.CONTACTLESS_P THEN 'CONTACTLESS'
+            WHEN g.R_MODE < p.CONTACTLESS_P + 0.15 THEN 'ECOM'
+            WHEN g.R_MODE < 0.98 THEN 'CHIP' ELSE 'MAGSTRIPE' END,
+       a.MCC, 'D' || p.CARD_IDX, FALSE, 'HISTORY_DENSE'
+FROM g
+JOIN CARD_PROFILE_TMP p ON p.CARD_IDX = g.CARD_IDX
+JOIN (SELECT ACCEPTOR_ID, MCC, ROW_NUMBER() OVER (ORDER BY ACCEPTOR_ID) - 1 AS ACC_IDX FROM ACCEPTORS) a
+  ON a.ACC_IDX = g.ACC_IDX;
+
+-- Dense-window fraud: same three patterns and timing as the simulator scenarios
+INSERT INTO CARD_TRANSACTIONS                                         -- P1 burst
+WITH i AS (SELECT UNIFORM(0, 4999, RANDOM()) AS CARD_IDX, UNIFORM(6, 10, RANDOM()) AS N,
+                  DATEADD(second, UNIFORM(0, 3*86400 - 600, RANDOM()), $DENSE_START) AS T0
+           FROM TABLE(GENERATOR(ROWCOUNT => 300))),
+     e AS (SELECT i.*, s.INDEX AS K FROM i, LATERAL FLATTEN(ARRAY_GENERATE_RANGE(0, i.N)) s)
+SELECT UUID_STRING(), p.CARD_ID, a.ACCEPTOR_ID, DATEADD(second, e.K * UNIFORM(2, 5, RANDOM()), e.T0),
+       ROUND(UNIFORM(3000, 9500, RANDOM()), -1), 'CONTACTLESS', a.MCC, 'DX' || UNIFORM(0, 99999, RANDOM()),
+       TRUE, 'HISTORY_DENSE'
+FROM e JOIN CARD_PROFILE_TMP p ON p.CARD_IDX = e.CARD_IDX
+JOIN (SELECT ACCEPTOR_ID, MCC, ROW_NUMBER() OVER (ORDER BY ACCEPTOR_ID) - 1 AS ACC_IDX FROM ACCEPTORS) a
+  ON a.ACC_IDX = MOD(e.CARD_IDX * 7 + e.K * 13, 800);
+
+INSERT INTO CARD_TRANSACTIONS                                         -- P2 high value
+SELECT UUID_STRING(), p.CARD_ID, a.ACCEPTOR_ID, DATEADD(second, UNIFORM(0, 3*86400 - 1, RANDOM()), $DENSE_START),
+       ROUND(p.BASE_AMOUNT * UNIFORM(10, 20, RANDOM()), -2), 'ECOM', a.MCC, 'DX' || UNIFORM(0, 99999, RANDOM()),
+       TRUE, 'HISTORY_DENSE'
+FROM (SELECT UNIFORM(0, 4999, RANDOM()) AS CARD_IDX, UNIFORM(0, 799, RANDOM()) AS ACC_IDX
+      FROM TABLE(GENERATOR(ROWCOUNT => 600))) g
+JOIN CARD_PROFILE_TMP p ON p.CARD_IDX = g.CARD_IDX
+JOIN (SELECT ACCEPTOR_ID, MCC, ROW_NUMBER() OVER (ORDER BY ACCEPTOR_ID) - 1 AS ACC_IDX FROM ACCEPTORS) a
+  ON a.ACC_IDX = g.ACC_IDX;
+
+INSERT INTO CARD_TRANSACTIONS                                         -- P3 compromised terminal
+WITH i AS (SELECT UNIFORM(0, 799, RANDOM()) AS ACC_IDX, UNIFORM(10, 14, RANDOM()) AS N,
+                  DATEADD(second, UNIFORM(0, 3*86400 - 600, RANDOM()), $DENSE_START) AS T0
+           FROM TABLE(GENERATOR(ROWCOUNT => 150))),
+     e AS (SELECT i.*, s.INDEX AS K FROM i, LATERAL FLATTEN(ARRAY_GENERATE_RANGE(0, i.N)) s)
+SELECT UUID_STRING(), p.CARD_ID, a.ACCEPTOR_ID, DATEADD(second, e.K * UNIFORM(1, 3, RANDOM()), e.T0),
+       ROUND(UNIFORM(100, 1500, RANDOM()), -1), 'CONTACTLESS', a.MCC, 'DX' || UNIFORM(0, 99999, RANDOM()),
+       TRUE, 'HISTORY_DENSE'
+FROM e
+JOIN (SELECT ACCEPTOR_ID, MCC, ROW_NUMBER() OVER (ORDER BY ACCEPTOR_ID) - 1 AS ACC_IDX FROM ACCEPTORS) a
+  ON a.ACC_IDX = e.ACC_IDX
+JOIN CARD_PROFILE_TMP p ON p.CARD_IDX = MOD(e.ACC_IDX * 31 + e.K * 337 + 11, 5000);
+
+-- Stream FV backfill source must be a permanent base table that matches the StreamSource schema
+CREATE OR REPLACE TABLE TXN_STREAM_BACKFILL AS
+SELECT CARD_ID, ACCEPTOR_ID, TS, AMOUNT::FLOAT AS AMOUNT, ENTRY_MODE
+FROM CARD_TRANSACTIONS;
+
+-- Sanity check
+SELECT COUNT(*) AS N_TXN, SUM(IS_FRAUD::INT) AS N_FRAUD,
+       ROUND(100 * AVG(IS_FRAUD::INT), 2) AS FRAUD_PCT, MIN(TS), MAX(TS)
+FROM CARD_TRANSACTIONS;

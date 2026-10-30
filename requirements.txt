@@ -1,0 +1,12 @@
+snowflake-ml-python>=2.5
+snowflake-snowpark-python
+snowflake-connector-python[secure-local-storage]
+snowpipe-streaming>=1.4
+httpx[http2]
+requests
+psycopg2-binary
+xgboost
+scikit-learn
+pandas
+streamlit
+matplotlib

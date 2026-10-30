@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+logs_*.txt
+*.pat
+.DS_Store
+261029_OnlineFeatureStore不正検知デモ構成/
+tools/build_memo.py
