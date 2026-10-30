@@ -11,32 +11,18 @@ All data is synthetic: 5,000 cards, 800 terminals, about 2.5M card transactions 
 
 ## Architecture
 
-```
-                 ┌──────────── 04_simulator.py (payment switch + authorization service) ───────────┐
-                 │   normal traffic ~2 TPS + injected attacks (BURST / TERMINAL / HIGH_VALUE)        │
-                 └──────┬───────────────────────────────────────────────────────────┬───────────────┘
-              (1) decision path                                              (2) data path
-                        │                                                           │
-   Query API  ──►  FRAUD_FG  (one call: batch + stream + real-time)      Snowpipe Streaming (high-perf.)
-        │                ▲                                               PIPE RAW.CARD_TRANSACTIONS_PIPE
-        ▼                │                                                          │
-   XGBoost (Model Registry, loaded in-process) ──► APPROVE / REVIEW / DECLINE      ▼
-        │                                                               RAW.CARD_TRANSACTIONS
-        ├──► Snowflake Postgres  fraud.auth_decisions / fraud.cases           │
-        │                                                                     ▼
-        └──► Ingest API ──► Stream FVs (CARD_VELOCITY, ACCEPTOR_VELOCITY)  Batch FV CARD_PROFILE
-                                │ online (<200ms P50)│ offline write-back   (60d / 90d windows)
-                                ▼                  ▼                              │
-                     ┌──── Online Feature Store (Snowflake Postgres serving layer) ◄┘
-                     │
-   05_app (Streamlit): live monitor, single authorization with SHAP reasons, case queue, data platform
-   03_train.py: ML Job on Container Runtime → generate_training_set → XGBoost → Model Registry
-```
+![Architecture](images/architecture.png)
+
+The diagram labels are in Japanese. 経路1 判定 = Path 1: decision, 経路2 データ基盤 = Path 2: data platform, 決済スイッチ役 = payment switch. Solid lines are data flows; dotted lines are feature reads.
 
 **Why there are two ingestion paths.** The documented way to get online data into a stream feature view is the Feature Store **Ingest REST API**; Snowpipe Streaming isn't a documented source for stream FVs. Each path has its own job:
 
 - **Ingest API:** freshest features for the authorization decision.
 - **Snowpipe Streaming:** the complete raw transaction record. It feeds the batch FV, analytics and retraining.
+
+## Demo
+
+![Demo](images/postgres-demo.gif)
 
 ## Feature mapping
 

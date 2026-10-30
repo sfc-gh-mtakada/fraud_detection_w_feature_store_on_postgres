@@ -11,32 +11,18 @@
 
 ## 構成
 
-```
-                 ┌──────────── 04_simulator.py（決済スイッチ + オーソリサービス）────────────┐
-                 │   通常取引 約2 TPS + 不正シナリオ（BURST / TERMINAL / HIGH_VALUE）            │
-                 └──────┬───────────────────────────────────────────────────────────┬──────────┘
-                  (1) 判定経路                                                 (2) データ経路
-                        │                                                           │
-   Query API  ──►  FRAUD_FG（1回の呼び出しで Batch・Stream・Real-time を取得）    Snowpipe Streaming（high-perf.）
-        │                ▲                                               PIPE RAW.CARD_TRANSACTIONS_PIPE
-        ▼                │                                                          │
-   XGBoost（Model Registry から読み込み、プロセス内で推論）──► APPROVE / REVIEW / DECLINE
-        │                                                                           ▼
-        ├──► Snowflake Postgres  fraud.auth_decisions / fraud.cases       RAW.CARD_TRANSACTIONS
-        │                                                                           │
-        └──► Ingest API ──► Stream FV（CARD_VELOCITY, ACCEPTOR_VELOCITY）  Batch FV CARD_PROFILE
-                                │ Online（P50 で 200ms 未満）│ Offline へ書き戻し   （60日 / 90日ウィンドウ）
-                                ▼                     ▼                             │
-                     ┌──── Online Feature Store（Snowflake Postgres のサービング層）◄┘
-                     │
-   05_app（Streamlit）: ライブ監視、1件オーソリと SHAP による判定理由、調査キュー、データ基盤
-   03_train.py: Container Runtime 上の ML Job → generate_training_set → XGBoost → Model Registry
-```
+![構成図](images/architecture.png)
+
+実線はデータの流れ、点線は特徴量の読み出しを表します。
 
 **取り込み経路が2本ある理由。** Stream Feature View にオンラインのデータを入れる方法として、ドキュメントに載っているのは Feature Store の **Ingest REST API** だけです。Snowpipe Streaming は Stream FV の入力元としては書かれていません。そのため次のように役割を分けています。
 
 - **Ingest API:** オーソリ判定に使う、最も新しい特徴量を作る経路。
 - **Snowpipe Streaming:** 取引の全カラムを保管する経路。Batch FV、分析、再学習に使います。
+
+## デモ画面
+
+![デモ画面](images/postgres-demo.gif)
 
 ## 特徴量の対応
 
